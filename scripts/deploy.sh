@@ -12,10 +12,13 @@ cd "$ROOT"
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/deploy.sh <tinystories|barista>
+usage: scripts/deploy.sh <tinystories|barista> [devkit|xiao_s3]
 
 The model is mandatory: the board holds one at a time, and deploying replaces
 whatever is already there, so which one is being written is never implied.
+The board defaults to devkit (generic ESP32-S3, 16MB flash) if omitted.
+xiao_s3 targets the Seeed XIAO ESP32S3 (8MB flash) and only barista fits
+there: tinystories' model.bin is ~14.9MB, too big for 8MB flash.
 
 Generates that model's device headers, runs the applicable host gates including
 the golden gate when present, compiles, and only then writes the model partition
@@ -27,9 +30,23 @@ EOF
   exit 2
 }
 
-# Argument first, before any tool lookup, build, or device access.
-[ $# -eq 1 ] || usage
+# Model first, before any tool lookup, build, or device access. Board is
+# optional and defaults to the devkit this script originally targeted, so an
+# existing single-argument invocation keeps behaving exactly as before.
+[ $# -eq 1 ] || [ $# -eq 2 ] || usage
 MODEL_KIND=$1
+BOARD_KIND=${2:-devkit}
+case "$BOARD_KIND" in
+  devkit) ;;
+  xiao_s3)
+    [ "$MODEL_KIND" = "barista" ] || {
+      echo "xiao_s3 has 8MB flash; only barista's ~4.6MB model fits there." >&2
+      echo "tinystories' model.bin is ~14.9MB and needs the devkit target." >&2
+      exit 1
+    }
+    ;;
+  *) usage ;;
+esac
 
 # --- model-specific configuration -------------------------------------------
 # MODEL_KIND selects; MODEL stays the path to the binary being flashed.
@@ -115,9 +132,37 @@ extra_gates() {
 }
 
 # --- everything below is shared ---------------------------------------------
+# Same on both boards: partitions_xiao_s3.csv keeps the model partition at this
+# same offset, only shrinking sizes to fit 8MB flash.
 PART_OFFSET=0x110000
 
-FQBN='esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=custom,PSRAM=opi,DebugLevel=info'
+# Extra compiler defines, board-specific. Passed via compiler.cpp.extra_flags
+# rather than build.extra_flags: the latter is where boards.txt puts
+# board-required defines (e.g. the USB CDC mode ones), and a CLI
+# --build-property replaces rather than appends, so reusing that name would
+# silently drop them.
+EXTRA_CPP_FLAGS=''
+
+case "$BOARD_KIND" in
+  devkit)
+    FQBN='esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=custom,PSRAM=opi,DebugLevel=info'
+    ;;
+  xiao_s3)
+    # Seeed XIAO ESP32S3 (plain, non-Sense): ESP32-S3R8, 8MB flash, 8MB
+    # in-package OPI PSRAM. This board's boards.txt has no "custom"
+    # PartitionScheme value (only default_8MB/max_app_8MB/tinyuf2*), unlike
+    # the generic esp32s3 board above. That's fine: platform.txt's prebuild
+    # hooks always copy the sketch directory's own partitions.csv over
+    # whichever scheme's table last, so any enumerated value here works so
+    # long as it doesn't pull in a non-default bootloader (tinyuf2* do, via
+    # build.custom_bootloader) - default_8MB does not.
+    # CDCOnBoot's value names are inverted from the generic esp32s3 board on
+    # this one: "default" is Enabled here, "cdc" is Disabled.
+    FQBN='esp32:esp32:XIAO_ESP32S3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=8M,PartitionScheme=default_8MB,PSRAM=opi,DebugLevel=info'
+    # No OLED is wired to this target's exposed pins, so run serial-only.
+    EXTRA_CPP_FLAGS='-DUSE_DISPLAY=0'
+    ;;
+esac
 
 # -O3, overriding the Arduino core default of -Os. The runtime carries no
 # per-function optimization attributes; this flag is the whole configuration.
@@ -184,12 +229,27 @@ cc $CFLAGS -DLLM_INT8_ACT=1 -o /tmp/llm_staging runtime/host_verify/staging_veri
 
 extra_gates
 
+# PartitionScheme=custom reads partitions.csv from the sketch directory
+# itself, with no FQBN option to point it elsewhere. For xiao_s3, swap in the
+# 8MB table for the build and restore the devkit one on exit (even on
+# failure), so the tracked file is never left mutated.
+if [ "$BOARD_KIND" = "xiao_s3" ]; then
+  cp "$SKETCH/partitions.csv" "$SKETCH/partitions.csv.devkit.bak"
+  cp "$SKETCH/partitions_xiao_s3.csv" "$SKETCH/partitions.csv"
+  restore_partitions() {
+    mv -f "$SKETCH/partitions.csv.devkit.bak" "$SKETCH/partitions.csv" 2>/dev/null || true
+  }
+  trap restore_partitions EXIT
+fi
+
 # Compile and verify before writing either image: a build failure after the
 # model flash would leave new weights under old firmware.
-BUILD_DIR="${TMPDIR:-/tmp}/esp32ai-build-$(basename "$SKETCH")"
-echo "=== compile $SKETCH ($OPT_FLAGS) ==="
+BUILD_DIR="${TMPDIR:-/tmp}/esp32ai-build-$(basename "$SKETCH")-$BOARD_KIND"
+echo "=== compile $SKETCH ($OPT_FLAGS, board=$BOARD_KIND) ==="
+compile_props=(--build-property "compiler.optimization_flags=$OPT_FLAGS")
+[ -n "$EXTRA_CPP_FLAGS" ] && compile_props+=(--build-property "compiler.cpp.extra_flags=$EXTRA_CPP_FLAGS")
 arduino-cli compile --fqbn "$FQBN" \
-  --build-property "compiler.optimization_flags=$OPT_FLAGS" \
+  "${compile_props[@]}" \
   --build-path "$BUILD_DIR" \
   "$SKETCH" 2>&1 | tail -2
 
@@ -207,6 +267,7 @@ BYTES=$(wc -c < "$MODEL" | tr -d ' ')
 echo
 echo "=== about to flash, replacing the model now on the board ==="
 printf "  model   : %s\n" "$MODEL_KIND"
+printf "  board   : %s\n" "$BOARD_KIND"
 printf "  sketch  : %s\n" "$SKETCH"
 printf "  binary  : %s\n" "$MODEL"
 printf "  port    : %s\n" "$PORT"
@@ -223,6 +284,6 @@ echo "=== upload firmware ==="
 arduino-cli upload -p "$PORT" --fqbn "$FQBN" --input-dir "$BUILD_DIR" "$SKETCH" 2>&1 | tail -1
 
 echo
-echo "flashed : $MODEL_KIND from $MODEL"
+echo "flashed : $MODEL_KIND ($BOARD_KIND) from $MODEL"
 echo "expect  : fp=$FP  bytes=$BYTES"
 echo "the board prints 'build: bytes=... fp=...' at boot - both must match."

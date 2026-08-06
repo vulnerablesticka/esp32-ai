@@ -70,7 +70,7 @@ NAMES+=("metadata.json")
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 1; }; }
 need hf
 need shasum
-need python3   # the metadata cross-check below is a python snippet
+need uv   # the metadata cross-check below runs via `uv run python`
 
 DEST="artifacts/$MODEL_KIND"
 
@@ -122,7 +122,7 @@ done
 # stay authoritative either way; a disagreement means the release is internally
 # inconsistent, which is reported rather than worked around.
 if [ -f "$STAGING/metadata.json" ]; then
-  if ! python3 - "$STAGING/metadata.json" "${PINNED[@]}" <<'PY'
+  if ! uv run python - "$STAGING/metadata.json" "${PINNED[@]}" <<'PY'
 import json, sys
 with open(sys.argv[1]) as fh:
     meta = json.load(fh)

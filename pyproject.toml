@@ -18,6 +18,9 @@ dependencies = [
 # benchmark hardware: uv sync --extra device
 [project.optional-dependencies]
 device = ["pyserial>=3.5"]
+# scripts/chat_ui.py: a Streamlit chat front end for the board's USB serial
+# Q&A loop. uv sync --extra chat
+chat = ["streamlit>=1.38", "pyserial>=3.5", "pandas>=2.0"]
 
 [build-system]
 requires = ["setuptools>=77"]
