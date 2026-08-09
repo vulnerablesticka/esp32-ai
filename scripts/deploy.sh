@@ -12,20 +12,21 @@ cd "$ROOT"
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/deploy.sh <tinystories|barista> [devkit|xiao_s3]
+usage: scripts/deploy.sh <tinystories|barista|knots> [devkit|xiao_s3]
 
 The model is mandatory: the board holds one at a time, and deploying replaces
 whatever is already there, so which one is being written is never implied.
 The board defaults to devkit (generic ESP32-S3, 16MB flash) if omitted.
-xiao_s3 targets the Seeed XIAO ESP32S3 (8MB flash) and only barista fits
-there: tinystories' model.bin is ~14.9MB, too big for 8MB flash.
+xiao_s3 targets the Seeed XIAO ESP32S3 (8MB flash): barista (~4.6MB) and
+knots (~1.25MB pilot) both fit there; tinystories' model.bin is ~14.9MB, too
+big for 8MB flash.
 
 Generates that model's device headers, runs the applicable host gates including
 the golden gate when present, compiles, and only then writes the model partition
 and the firmware.
 
 Artifact paths may be overridden: ARTIFACTS, MODEL, TOKENIZER, GOLDEN, and for
-barista also VOCAB and LAYOUT.
+barista and knots also VOCAB and LAYOUT.
 EOF
   exit 2
 }
@@ -39,11 +40,14 @@ BOARD_KIND=${2:-devkit}
 case "$BOARD_KIND" in
   devkit) ;;
   xiao_s3)
-    [ "$MODEL_KIND" = "barista" ] || {
-      echo "xiao_s3 has 8MB flash; only barista's ~4.6MB model fits there." >&2
-      echo "tinystories' model.bin is ~14.9MB and needs the devkit target." >&2
-      exit 1
-    }
+    case "$MODEL_KIND" in
+      barista|knots) ;;
+      *)
+        echo "xiao_s3 has 8MB flash; barista and knots fit there." >&2
+        echo "tinystories' model.bin is ~14.9MB and needs the devkit target." >&2
+        exit 1
+        ;;
+    esac
     ;;
   *) usage ;;
 esac
@@ -84,6 +88,26 @@ case "$MODEL_KIND" in
       --layout \"$LAYOUT\" \\
       --out-dir \"$ARTIFACTS\""
     ;;
+  knots)
+    SKETCH=firmware/esp32_knots
+    ARTIFACTS=${ARTIFACTS:-artifacts/knots}
+    MODEL=${MODEL:-$ARTIFACTS/model.bin}
+    TOKENIZER=${TOKENIZER:-$ARTIFACTS/tokenizer.json}
+    GOLDEN=${GOLDEN:-$ARTIFACTS/golden.txt}
+    VOCAB=${VOCAB:-$ARTIFACTS/vocab.json}
+    LAYOUT=${LAYOUT:-$ARTIFACTS/layout.json}
+    REQUIRED=("$MODEL" "$TOKENIZER" "$VOCAB" "$LAYOUT")
+    # Same untied-head shape as barista, but there is no published release to
+    # fetch: fill artifacts/knots/ by running the research/knots/ pipeline
+    # locally (see firmware/esp32_knots/README.md), then export.
+    EXPORT_HINT="  no published release exists yet; fill $ARTIFACTS/ by running
+  the research/knots/ pipeline locally (prepare.py, build_vocab.py,
+  build_dataset.py, train.py), then export.py:
+    uv run python $SKETCH/tools/export.py --checkpoint <path> \\
+      --vocab \"$VOCAB\" \\
+      --layout \"$LAYOUT\" \\
+      --out-dir \"$ARTIFACTS\""
+    ;;
   *)
     usage
     ;;
@@ -103,7 +127,7 @@ prepare_headers() {
       uv run python "$SKETCH/tools/generate_vocab.py" \
         --tokenizer "$TOKENIZER" --out "$SKETCH/generated/vocab.h" 2>&1 | grep wrote
       ;;
-    barista)
+    barista|knots)
       echo "=== generate word tables from $VOCAB and $LAYOUT ==="
       uv run python "$SKETCH/tools/generate_vocab_headers.py" \
         --vocab "$VOCAB" --layout "$LAYOUT" \
@@ -121,7 +145,7 @@ extra_gates() {
     tinystories)
       : # The device only decodes: there is no on-device encoder to check.
       ;;
-    barista)
+    barista|knots)
       # The device encodes questions, so its ids must equal the tokenizer's, and
       # the reused word mappings must resolve to the ids they claim.
       echo "=== host verify: device encoder vs Hugging Face, and the word map ==="
@@ -230,16 +254,20 @@ cc $CFLAGS -DLLM_INT8_ACT=1 -o /tmp/llm_staging runtime/host_verify/staging_veri
 extra_gates
 
 # PartitionScheme=custom reads partitions.csv from the sketch directory
-# itself, with no FQBN option to point it elsewhere. For xiao_s3, swap in the
-# 8MB table for the build and restore the devkit one on exit (even on
-# failure), so the tracked file is never left mutated.
-if [ "$BOARD_KIND" = "xiao_s3" ]; then
-  cp "$SKETCH/partitions.csv" "$SKETCH/partitions.csv.devkit.bak"
-  cp "$SKETCH/partitions_xiao_s3.csv" "$SKETCH/partitions.csv"
-  restore_partitions() {
-    mv -f "$SKETCH/partitions.csv.devkit.bak" "$SKETCH/partitions.csv" 2>/dev/null || true
-  }
-  trap restore_partitions EXIT
+# itself, with no FQBN option to point it elsewhere. Sketches that ship a
+# named partitions_devboard.csv (barista, knots) therefore treat
+# partitions.csv as a pure build artifact: the correct named source for
+# BOARD_KIND is copied over it before every compile, for either board, and
+# it is never a source of truth (see .gitignore) or restored afterward --
+# the next run just regenerates it. Sketches with no partitions_devboard.csv
+# (tinystories, devkit-only) keep their partitions.csv as the source of
+# truth directly, untouched here.
+DEVBOARD_PARTITIONS="$SKETCH/partitions_devboard.csv"
+if [ -f "$DEVBOARD_PARTITIONS" ]; then
+  case "$BOARD_KIND" in
+    devkit) cp "$DEVBOARD_PARTITIONS" "$SKETCH/partitions.csv" ;;
+    xiao_s3) cp "$SKETCH/partitions_xiao_s3.csv" "$SKETCH/partitions.csv" ;;
+  esac
 fi
 
 # Compile and verify before writing either image: a build failure after the

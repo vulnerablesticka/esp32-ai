@@ -1,0 +1,15 @@
+# Name,    Type, SubType, Offset,    Size,      Flags
+#
+# For the XIAO ESP32S3, which has 8MB flash rather than the 16MB the default
+# partitions.csv assumes. Cloned from firmware/esp32_barista/partitions_xiao_s3.csv:
+# barista's model.bin (~4.6MB) and knots' pilot model.bin (~1.29MB) both fit
+# the 6MB model partition here; tinystories' ~14.9MB needs the devkit's 16MB
+# table.
+#
+# Same offsets as partitions.csv up through the model partition, just shrunk,
+# so scripts/deploy.sh's PART_OFFSET (0x110000) is unchanged; only the sizes
+# and the coredump offset move to fit under 0x800000 (8MB).
+nvs,       data, nvs,     0x9000,    0x5000,
+factory,   app,  factory, 0x10000,   0x100000,
+model,     data, 0x40,    0x110000,  0x600000,
+coredump,  data, coredump,0x710000,  0x10000,

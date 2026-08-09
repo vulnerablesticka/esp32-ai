@@ -42,9 +42,9 @@ required for `devkit` builds with a panel wired.
 the generic esp32s3 board in two ways `deploy.sh` already accounts for: there
 is no `custom` `PartitionScheme` value (only `default_8MB`, `max_app_8MB`,
 `tinyuf2`, `tinyuf2_noota`), and `CDCOnBoot`'s value names are inverted
-(`default` is Enabled here, `cdc` is Disabled). The custom `partitions.csv`
-swap still works with `PartitionScheme=default_8MB` — the core's prebuild
-hooks always copy the sketch directory's own `partitions.csv` over whichever
+(`default` is Enabled here, `cdc` is Disabled). The `partitions.csv` swap
+still works with `PartitionScheme=default_8MB` — the core's prebuild hooks
+always copy the sketch directory's own `partitions.csv` over whichever
 scheme's table last, regardless of which enumerated value is selected. If a
 compile rejects some other menu option, check the exact keys for your
 installed core version with:
@@ -69,10 +69,14 @@ and then the firmware, and prints the fingerprint the board should report
 back. Compilation happens before either flash, so a build failure cannot leave
 new weights under old firmware.
 
-For `xiao_s3`, `deploy.sh` temporarily swaps in `partitions_xiao_s3.csv` (an
-8MB-flash layout; same `model` partition offset, smaller sizes) for the build
-and restores the devkit `partitions.csv` afterward, so the tracked file is
-never left modified.
+The tracked source of truth for each board is named after it —
+`partitions_devboard.csv` and `partitions_xiao_s3.csv` (an 8MB-flash layout;
+same `model` partition offset, smaller sizes). Arduino's `PartitionScheme=custom`
+always reads a file literally named `partitions.csv` from the sketch
+directory, with no option to point it elsewhere, so `deploy.sh` copies
+whichever named file the target board needs over `partitions.csv` before
+every compile. That file is therefore a build artifact, not a source of
+truth, and is gitignored rather than restored afterward.
 
 The model argument is mandatory: the board holds one model at a time, and
 deploying replaces whichever is installed. On `xiao_s3`, only `barista` is

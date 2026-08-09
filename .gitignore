@@ -3,11 +3,15 @@ __pycache__/
 .venv/
 *.pyc
 *.egg-info/
+.streamlit
 
 # data + tokenizers (regenerate with research/tinystories/prepare.py)
 data/*.bin
 data/*.txt
 data/*.json
+data/**/*.bin
+data/**/*.txt
+data/**/*.json
 
 # training outputs
 runs/
@@ -18,6 +22,15 @@ runs/
 
 # headers each sketch generates from those artifacts
 firmware/**/generated/
+
+# for sketches that ship a named partitions_devboard.csv/partitions_xiao_s3.csv
+# (barista, knots), scripts/deploy.sh copies whichever the target board needs
+# over partitions.csv before every compile -- Arduino's PartitionScheme=custom
+# always reads that exact filename, with no option to point it elsewhere. The
+# file is therefore a build artifact there, never a source of truth. Sketches
+# with no partitions_devboard.csv (tinystories) keep their own tracked
+# partitions.csv untouched; this pattern does not affect an already-tracked file.
+firmware/*/partitions.csv
 
 # raw video / recordings (demo footage - keep out of the repo)
 video/
