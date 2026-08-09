@@ -3,12 +3,38 @@
 #
 # The board has one model partition. Deploying either model replaces whichever
 # one is currently installed; there is no repartitioning trick.
-# pipefail: every step is piped through tail/grep/tr, and `set -e` alone does
-# not see a failure on the left of a pipe.
+# pipefail: some steps below are piped, and `set -e` alone does not see a
+# failure on the left of a pipe.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+# Run one step of the deployment. On success only the interesting lines are
+# shown, because a working run should read as a short checklist. On failure the
+# whole output is printed and the script stops: a compiler error truncated to
+# its last two lines is worse than no summary at all.
+#
+# SHOW is a grep pattern for the lines worth keeping; without it the last $keep
+# lines are shown. Carriage returns become newlines so esptool's progress bar
+# does not arrive as one enormous line.
+step() {
+  local keep=$1 label=$2
+  shift 2
+  local out status=0
+  out=$("$@" 2>&1) || status=$?
+  out=$(printf '%s\n' "$out" | tr '\r' '\n')
+  if [ "$status" -ne 0 ]; then
+    printf '%s\n' "$out" >&2
+    echo "failed: $label" >&2
+    exit "$status"
+  fi
+  if [ -n "${SHOW:-}" ]; then
+    printf '%s\n' "$out" | grep -E "$SHOW" || true
+  else
+    printf '%s\n' "$out" | tail -n "$keep"
+  fi
+}
 
 usage() {
   cat >&2 <<'EOF'
@@ -62,11 +88,9 @@ case "$MODEL_KIND" in
     TOKENIZER=${TOKENIZER:-$ARTIFACTS/tokenizer.json}
     GOLDEN=${GOLDEN:-$ARTIFACTS/golden.txt}
     REQUIRED=("$MODEL" "$TOKENIZER")
-    # That exporter has no output-path option: it always writes
-    # artifacts/tinystories/, so a custom path here needs a copy afterwards.
-    EXPORT_HINT="  uv run python -m research.tinystories.export <checkpoint-tag>
-  It always writes to artifacts/tinystories/. If a different path is selected
-  here, copy the files across afterwards."
+    FETCH_HINT="  scripts/fetch_model.sh tinystories
+  Downloads always install under artifacts/tinystories/. If a different path
+  is selected here, copy the files across afterwards."
     ;;
   barista)
     SKETCH=firmware/esp32_barista
@@ -77,16 +101,9 @@ case "$MODEL_KIND" in
     VOCAB=${VOCAB:-$ARTIFACTS/vocab.json}
     LAYOUT=${LAYOUT:-$ARTIFACTS/layout.json}
     REQUIRED=("$MODEL" "$TOKENIZER" "$VOCAB" "$LAYOUT")
-    # export.py writes model.bin, the goldens and metadata. It reads the other
-    # three, which are frozen with the trained model and cannot be regenerated
-    # here, so they have to be in place first.
-    EXPORT_HINT="  tokenizer.json, vocab.json and layout.json are frozen assets:
-  place them at the paths above first. Then produce model.bin, the goldens and
-  metadata with:
-    uv run python $SKETCH/tools/export.py --checkpoint <path> \\
-      --vocab \"$VOCAB\" \\
-      --layout \"$LAYOUT\" \\
-      --out-dir \"$ARTIFACTS\""
+    FETCH_HINT="  scripts/fetch_model.sh barista
+  Downloads always install under artifacts/barista/. If a different path is
+  selected here, copy the files across afterwards."
     ;;
   knots)
     SKETCH=firmware/esp32_knots
@@ -113,6 +130,9 @@ case "$MODEL_KIND" in
     ;;
 esac
 
+# These generators run isolated from the project environment: none of them needs
+# torch, and deploying should not synchronise it. The tokenizer version is
+# pinned because `--with` does not consult uv.lock.
 # Every generator and checker is given the selected paths explicitly. Deriving
 # them again from defaults would let an ARTIFACTS override build headers from one
 # directory while conformance silently checked another.
@@ -124,18 +144,21 @@ prepare_headers() {
       # a stale header from a different tokenizer with the same entry count would
       # pass that check and decode every token wrongly.
       echo "=== generate $SKETCH/generated/vocab.h from $TOKENIZER ==="
-      uv run python "$SKETCH/tools/generate_vocab.py" \
-        --tokenizer "$TOKENIZER" --out "$SKETCH/generated/vocab.h" 2>&1 | grep wrote
+      SHOW=wrote step 0 "generate vocab.h" \
+        uv run --no-project --with 'tokenizers==0.23.1' python "$SKETCH/tools/generate_vocab.py" \
+        --tokenizer "$TOKENIZER" --out "$SKETCH/generated/vocab.h"
       ;;
     barista|knots)
       echo "=== generate word tables from $VOCAB and $LAYOUT ==="
-      uv run python "$SKETCH/tools/generate_vocab_headers.py" \
+      SHOW=wrote step 0 "generate word tables" \
+        uv run --no-project python "$SKETCH/tools/generate_vocab_headers.py" \
         --vocab "$VOCAB" --layout "$LAYOUT" \
-        --out-dir "$SKETCH/generated" 2>&1 | grep wrote
+        --out-dir "$SKETCH/generated"
       echo "=== generate encoder asset from $TOKENIZER ==="
-      uv run python "$SKETCH/tools/generate_tokenizer_header.py" \
+      SHOW=wrote step 0 "generate encoder asset" \
+        uv run --no-project python "$SKETCH/tools/generate_tokenizer_header.py" \
         --tokenizer "$TOKENIZER" \
-        --out "$SKETCH/generated/tokenizer_encoder.h" 2>&1 | grep wrote
+        --out "$SKETCH/generated/tokenizer_encoder.h"
       ;;
   esac
 }
@@ -149,8 +172,9 @@ extra_gates() {
       # The device encodes questions, so its ids must equal the tokenizer's, and
       # the reused word mappings must resolve to the ids they claim.
       echo "=== host verify: device encoder vs Hugging Face, and the word map ==="
-      uv run python "$SKETCH/tools/verify_tokenizer.py" \
-        --tokenizer "$TOKENIZER" --vocab "$VOCAB" --layout "$LAYOUT" 2>&1 | tail -1
+      step 1 "tokenizer conformance" \
+        uv run --no-project --with 'tokenizers==0.23.1' python "$SKETCH/tools/verify_tokenizer.py" \
+        --tokenizer "$TOKENIZER" --vocab "$VOCAB" --layout "$LAYOUT"
       ;;
   esac
 }
@@ -225,21 +249,28 @@ for f in "${REQUIRED[@]}"; do
 done
 if [ "$missing" -ne 0 ]; then
   echo "required artifacts are missing; the expected paths are listed above" >&2
-  echo "$EXPORT_HINT" >&2
+  echo "$FETCH_HINT" >&2
   exit 1
 fi
 
 prepare_headers
 
 CFLAGS='-O3 -Wall -Wextra'
+# One workspace per run, holding the host gate binaries and the firmware build.
+# A shared path lets two concurrent deployments compile over each other.
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/esp32ai-deploy-XXXXXX")
+trap 'rm -rf -- "$RUN_DIR"' EXIT
+GATE_DIR="$RUN_DIR/gates"
+BUILD_DIR="$RUN_DIR/build"
+mkdir -p "$GATE_DIR" "$BUILD_DIR"
 
 # The golden is produced by the exporter, which this script does not invoke, so
 # it may simply be absent. Skip visibly rather than fail: staging_verify below
 # needs no golden and still runs.
 if [ -f "$GOLDEN" ]; then
   echo "=== host verify: exact int4 path vs PyTorch golden ==="
-  cc $CFLAGS -o /tmp/llm_verify runtime/host_verify/verify.c -lm
-  /tmp/llm_verify "$MODEL" "$GOLDEN" 2>&1 | tail -2
+  cc $CFLAGS -o "$GATE_DIR/llm_verify" runtime/host_verify/verify.c -lm
+  step 2 "golden gate" "$GATE_DIR/llm_verify" "$MODEL" "$GOLDEN"
 else
   echo "=== host verify: SKIPPED, no golden at $GOLDEN ==="
 fi
@@ -248,8 +279,8 @@ fi
 # does not reach that code - it exercises the exact int4 path - so without
 # this the thing actually executing on the board has no host gate.
 echo "=== host verify: int8 staging + platform hooks ==="
-cc $CFLAGS -DLLM_INT8_ACT=1 -o /tmp/llm_staging runtime/host_verify/staging_verify.c -lm
-/tmp/llm_staging "$MODEL" 2>&1 | tail -3
+cc $CFLAGS -DLLM_INT8_ACT=1 -o "$GATE_DIR/llm_staging" runtime/host_verify/staging_verify.c -lm
+step 3 "staging gate" "$GATE_DIR/llm_staging" "$MODEL"
 
 extra_gates
 
@@ -279,7 +310,7 @@ compile_props=(--build-property "compiler.optimization_flags=$OPT_FLAGS")
 arduino-cli compile --fqbn "$FQBN" \
   "${compile_props[@]}" \
   --build-path "$BUILD_DIR" \
-  "$SKETCH" 2>&1 | tail -2
+  "$SKETCH"
 
 # Compute the same FNV-1a fingerprint the firmware prints at boot, and show it
 # before writing anything, so what is about to be installed is stated up front.
@@ -304,12 +335,14 @@ printf "  expect  : fp=%s\n" "$FP"
 echo
 
 echo "=== flash model -> $PORT @ $PART_OFFSET ==="
-"$ESPTOOL" --chip esp32s3 --port "$PORT" --baud 921600 \
-  write_flash "$PART_OFFSET" "$MODEL" 2>&1 | tr '\r' '\n' | tail -2
+step 2 "flash model" \
+  "$ESPTOOL" --chip esp32s3 --port "$PORT" --baud 921600 \
+  write_flash "$PART_OFFSET" "$MODEL"
 
 # --input-dir: `upload` does not rebuild, so point it at the build just made.
 echo "=== upload firmware ==="
-arduino-cli upload -p "$PORT" --fqbn "$FQBN" --input-dir "$BUILD_DIR" "$SKETCH" 2>&1 | tail -1
+step 1 "upload firmware" \
+  arduino-cli upload -p "$PORT" --fqbn "$FQBN" --input-dir "$BUILD_DIR" "$SKETCH"
 
 echo
 echo "flashed : $MODEL_KIND ($BOARD_KIND) from $MODEL"

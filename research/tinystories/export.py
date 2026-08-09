@@ -38,7 +38,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUNS = str(ROOT / "runs")
 OUT = str(ROOT / "artifacts" / "tinystories")
-TOK = str(ROOT / "data" / "bpe32768.json")
 MAGIC = 0x00454C50  # "PLE\0"
 FORMAT_VERSION = 1
 HEADER_BYTES = 56
@@ -117,7 +116,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("tag", nargs="?", default="ple-cleandeploy-s0",
                     help="checkpoint tag under runs/, without .pt")
-    ap.add_argument("--tokenizer", default=TOK,
+    ap.add_argument("--tokenizer", required=True,
                     help="tokenizer this checkpoint was trained with; its size "
                          "becomes output_vocab")
     ap.add_argument("--allow-unverified-tokenizer", action="store_true",
@@ -217,7 +216,14 @@ def main():
     # Copy the tokenizer beside the weights so the artifact directory is a
     # complete, self-contained model: everything the firmware build and the
     # device need, and nothing that has to be looked up elsewhere.
-    shutil.copyfile(args.tokenizer, os.path.join(OUT, "tokenizer.json"))
+    # Re-exporting from the artifact directory passes the destination back in as
+    # the source. Compare the files rather than the paths: a symlink or a hard
+    # link has a different path and is still the same file, and copyfile raises
+    # on that rather than doing nothing.
+    tokenizer_out = os.path.join(OUT, "tokenizer.json")
+    same = os.path.exists(tokenizer_out) and os.path.samefile(args.tokenizer, tokenizer_out)
+    if not same:
+        shutil.copyfile(args.tokenizer, tokenizer_out)
 
     # Keep the tied output head == dequantized input embedding. state_dict lists
     # both keys for tied weights; without this the head silently stays fp32 and
